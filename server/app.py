@@ -1,65 +1,73 @@
 from flask import Flask, request, make_response, jsonify
 from flask_migrate import Migrate
 from flask_marshmallow import Marshmallow
-from marshmallow import fields, validate
+from marshmallow import fields, validate, ValidationError
 from models import db, Exercise, Workout, WorkoutExercise
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///app.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-migrate = Migrate(app, db)
 db.init_app(app)
+migrate = Migrate(app, db)
 ma = Marshmallow(app)
 
-# --- SCHEMAS (Validation & Serialization) ---
+# --- SCHEMAS ---
 
-class ExerciseSchema(ma.SQLAlchemySchema):
+class WorkoutExerciseSchema(ma.SQLAlchemyAutoSchema):
+    class Meta:
+        model = WorkoutExercise
+        load_instance = True
+        include_fk = True  # Includes workout_id and exercise_id
+    
+    # Schema Validations (Requirement: >1)
+    reps = ma.auto_field(validate=validate.Range(min=1))
+    sets = ma.auto_field(validate=validate.Range(min=1))
+
+class ExerciseSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = Exercise
+        load_instance = True
     
-    id = ma.auto_field()
-    # Schema Validation 1: Length check
-    name = ma.auto_field(validate=validate.Length(min=3))
-    category = ma.auto_field()
-    equipment_needed = ma.auto_field()
+    # Schema Validation
+    name = ma.auto_field(validate=validate.Length(min=2))
+    # Nested relationship for GET /exercises/<id>
+    workout_exercises = fields.Nested(WorkoutExerciseSchema, many=True, dump_only=True)
 
-class WorkoutSchema(ma.SQLAlchemySchema):
+class WorkoutSchema(ma.SQLAlchemyAutoSchema):
     class Meta:
         model = Workout
+        load_instance = True
     
-    id = ma.auto_field()
-    date = ma.auto_field()
-    # Schema Validation 2: Range check
+    # Schema Validation
     duration_minutes = ma.auto_field(validate=validate.Range(min=1))
-    notes = ma.auto_field()
+    # Nested relationship for GET /workouts/<id> (Stretch Goal)
+    workout_exercises = fields.Nested(WorkoutExerciseSchema, many=True, dump_only=True)
 
-exercise_schema = ExerciseSchema()
-exercises_schema = ExerciseSchema(many=True)
+# Initialize schemas
 workout_schema = WorkoutSchema()
 workouts_schema = WorkoutSchema(many=True)
+exercise_schema = ExerciseSchema()
+exercises_schema = ExerciseSchema(many=True)
+workout_exercise_schema = WorkoutExerciseSchema()
 
 # --- ROUTES ---
 
+# WORKOUT ROUTES
 @app.route('/workouts', methods=['GET', 'POST'])
 def workouts():
     if request.method == 'GET':
-        w = Workout.query.all()
-        return make_response(workouts_schema.jsonify(w), 200)
+        return make_response(workouts_schema.jsonify(Workout.query.all()), 200)
     
     if request.method == 'POST':
-        data = request.get_json()
         try:
-            new_workout = Workout(
-                date=date.fromisoformat(data['date']),
-                duration_minutes=data.get('duration_minutes'),
-                notes=data.get('notes')
-            )
+            # load_instance=True automatically creates the Workout object
+            new_workout = workout_schema.load(request.get_json(), session=db.session)
             db.session.add(new_workout)
             db.session.commit()
             return make_response(workout_schema.jsonify(new_workout), 201)
-        except Exception as e:
-            return make_response({"errors": [str(e)]}, 400)
+        except ValidationError as e:
+            return make_response({"errors": e.messages}, 400)
 
 @app.route('/workouts/<int:id>', methods=['GET', 'DELETE'])
 def workout_by_id(id):
@@ -72,39 +80,51 @@ def workout_by_id(id):
         db.session.commit()
         return make_response({}, 204)
 
+# EXERCISE ROUTES
 @app.route('/exercises', methods=['GET', 'POST'])
 def exercises():
     if request.method == 'GET':
-        exs = Exercise.query.all()
-        return make_response(exercises_schema.jsonify(exs), 200)
+        return make_response(exercises_schema.jsonify(Exercise.query.all()), 200)
     
     if request.method == 'POST':
-        data = request.get_json()
         try:
-            new_ex = Exercise(
-                name=data['name'],
-                category=data['category'],
-                equipment_needed=data.get('equipment_needed', False)
-            )
+            new_ex = exercise_schema.load(request.get_json(), session=db.session)
             db.session.add(new_ex)
             db.session.commit()
             return make_response(exercise_schema.jsonify(new_ex), 201)
-        except Exception as e:
-            return make_response({"errors": [str(e)]}, 400)
+        except ValidationError as e:
+            return make_response({"errors": e.messages}, 400)
 
+@app.route('/exercises/<int:id>', methods=['GET', 'DELETE'])
+def exercise_by_id(id):
+    exercise = Exercise.query.get_or_404(id)
+    if request.method == 'GET':
+        return make_response(exercise_schema.jsonify(exercise), 200)
+    
+    if request.method == 'DELETE':
+        db.session.delete(exercise)
+        db.session.commit()
+        return make_response({}, 204)
+
+# JOIN TABLE ROUTE
 @app.route('/workouts/<int:wid>/exercises/<int:eid>/workout_exercises', methods=['POST'])
 def add_exercise_to_workout(wid, eid):
-    data = request.get_json()
-    new_we = WorkoutExercise(
-        workout_id=wid,
-        exercise_id=eid,
-        reps=data.get('reps'),
-        sets=data.get('sets'),
-        duration_seconds=data.get('duration_seconds')
-    )
-    db.session.add(new_we)
-    db.session.commit()
-    return make_response({"message": "Exercise added to workout"}, 201)
+    # Verify parents exist first
+    Workout.query.get_or_404(wid)
+    Exercise.query.get_or_404(eid)
+    
+    try:
+        data = request.get_json()
+        # Manually inject the IDs from the URL into the data for the schema to load
+        data['workout_id'] = wid
+        data['exercise_id'] = eid
+        
+        new_we = workout_exercise_schema.load(data, session=db.session)
+        db.session.add(new_we)
+        db.session.commit()
+        return make_response(workout_exercise_schema.jsonify(new_we), 201)
+    except ValidationError as e:
+        return make_response({"errors": e.messages}, 400)
 
 if __name__ == '__main__':
     app.run(port=5555, debug=True)
